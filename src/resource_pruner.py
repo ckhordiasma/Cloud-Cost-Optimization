@@ -16,6 +16,7 @@ Usage:
 import argparse
 import json
 import sys
+import time
 from collections import defaultdict
 import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
@@ -23,6 +24,8 @@ from botocore.exceptions import ClientError, NoCredentialsError
 
 EC2_BATCH_SIZE = 1000
 VPCE_BATCH_SIZE = 25
+NAT_DELETE_WAIT_DELAY = 15
+NAT_DELETE_MAX_ATTEMPTS = 40
 
 
 def load_traces(input_file, include_questionable=False):
@@ -141,14 +144,15 @@ def delete_nat_gateways(ec2, traces, dry_run):
 
     if not actionable:
         print("No NAT gateways to delete.")
-        return
+        return []
 
     if dry_run:
         _print_dry_run(actionable, "NAT gateways")
-        return
+        return []
 
     print(f"\n=== DELETING {len(actionable)} NAT gateways ===\n")
     success = 0
+    deleted_ids = []
     failed = []
 
     for t in actionable:
@@ -157,6 +161,7 @@ def delete_nat_gateways(ec2, traces, dry_run):
         try:
             ec2.delete_nat_gateway(NatGatewayId=nat_id)
             success += 1
+            deleted_ids.append(nat_id)
         except ClientError as e:
             print(f"    Error: {e}")
             failed.append(nat_id)
@@ -166,6 +171,35 @@ def delete_nat_gateways(ec2, traces, dry_run):
         print("Failed NAT gateway IDs:")
         for nid in failed:
             print(f"  {nid}")
+
+    return deleted_ids
+
+
+def wait_for_nat_gateways_deleted(ec2, nat_gateway_ids):
+    remaining = list(nat_gateway_ids)
+    print(f"\nWaiting for {len(remaining)} NAT gateways to release their Elastic IPs...")
+
+    for attempt in range(NAT_DELETE_MAX_ATTEMPTS):
+        response = ec2.describe_nat_gateways(NatGatewayIds=remaining)
+        states = {
+            gateway["NatGatewayId"]: gateway.get("State", "")
+            for gateway in response.get("NatGateways", [])
+        }
+        remaining = [
+            nat_id
+            for nat_id in remaining
+            if states.get(nat_id, "deleted") != "deleted"
+        ]
+        if not remaining:
+            print("All NAT gateways deleted.")
+            return True
+        if attempt < NAT_DELETE_MAX_ATTEMPTS - 1:
+            time.sleep(NAT_DELETE_WAIT_DELAY)
+
+    print("Warning: timed out waiting for NAT gateways to delete:")
+    for nat_id in remaining:
+        print(f"  {nat_id}")
+    return False
 
 
 def delete_vpc_endpoints(ec2, traces, dry_run):
@@ -228,15 +262,12 @@ def release_eips(ec2, traces, dry_run):
         public_ip = t.get("instance_type", "")
         label = f"{alloc_id} ({public_ip})" if public_ip else alloc_id
         try:
-            if t.get("state") == "associated":
-                assoc_id = t.get("tags", {}).get("AssociationId", "")
-                if not assoc_id:
-                    resp = ec2.describe_addresses(AllocationIds=[alloc_id])
-                    addrs = resp.get("Addresses", [])
-                    assoc_id = addrs[0].get("AssociationId", "") if addrs else ""
-                if assoc_id:
-                    print(f"  Disassociating {label}...")
-                    ec2.disassociate_address(AssociationId=assoc_id)
+            resp = ec2.describe_addresses(AllocationIds=[alloc_id])
+            addrs = resp.get("Addresses", [])
+            assoc_id = addrs[0].get("AssociationId", "") if addrs else ""
+            if assoc_id:
+                print(f"  Disassociating {label}...")
+                ec2.disassociate_address(AssociationId=assoc_id)
             print(f"  Releasing {label}...")
             ec2.release_address(AllocationId=alloc_id)
             success += 1
@@ -308,11 +339,14 @@ def main():
 
     if ec2_traces:
         terminate_instances(ec2, ec2_traces, dry_run)
+    deleted_nat_gateway_ids = []
     if nat_traces:
-        delete_nat_gateways(ec2, nat_traces, dry_run)
+        deleted_nat_gateway_ids = delete_nat_gateways(ec2, nat_traces, dry_run)
     if vpce_traces:
         delete_vpc_endpoints(ec2, vpce_traces, dry_run)
     if eip_traces:
+        if deleted_nat_gateway_ids:
+            wait_for_nat_gateways_deleted(ec2, deleted_nat_gateway_ids)
         release_eips(ec2, eip_traces, dry_run)
 
 
